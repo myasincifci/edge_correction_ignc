@@ -1,138 +1,87 @@
-from functools import partial
-from typing import Any
-from types import MethodType
-
+import numpy as np
 import pytorch_lightning as L
 import torch
-import torch.optim as optim
-import torchmetrics
-from pytorch_lightning.utilities.types import STEP_OUTPUT
-from torch import Tensor, nn
-from torch.autograd import Function
+from torch import nn
 from torch import nn
 from torch.nn import functional as F
-from torchvision.models.resnet import resnet18, ResNet18_Weights
-from torch.optim import lr_scheduler
+import timm
 
-from torch.distributions.beta import Beta
+class Regressor(L.LightningModule):
+    def __init__(self, cfg, c_to_i):
+        super().__init__()
+        self.backbone, out_dim = get_backbone(cfg.backbone.type)
+        self.head = nn.Sequential(
+            nn.Linear(out_dim, 64), #128
+            nn.LeakyReLU(),
+            nn.Linear(64, 32), #64
+            nn.LeakyReLU(),
+            nn.Linear(32, 1)
+        )
 
-class MixStyle(nn.Module):
-    def __init__(self, p=0.5, alpha=0.1, eps=1e-6, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.p = p
-        self.alpha = alpha
-        self.eps = eps
+        self.lr = cfg.param.lr
+        self.c_to_i = c_to_i
+
+    def idx_to_class(self, idcs: torch.Tensor):
+        reverse_dict = {v: float(k) for k, v in self.c_to_i.items()}
+        _idcs = idcs.cpu().numpy()
+
+        mapped = np.vectorize(reverse_dict.get)(_idcs)
+        return torch.from_numpy(mapped).to(torch.float32).to(self.device)
 
     def forward(self, x):
-        if not self.training:
-            return x
-        
-        if torch.rand(1).item() > self.p:
-            return x
+        x = self.backbone(x)
+        x = self.head(x)
+        x = F.sigmoid(x)
 
-        B = x.size(0) # batch size
+        x = 50.0*x - 25.0
 
-        mu = x.mean(dim=[2, 3], keepdim=True) # compute instance mean
-        var = x.var(dim=[2, 3], keepdim=True) # compute instance variance
-        sig = (var + self.eps).sqrt() # compute instance standard deviation
-        mu, sig = mu.detach(), sig.detach() # block gradients
-        x_normed = (x - mu) / sig # normalize input
+        return x
 
-        lmda = Beta(self.alpha, self.alpha).sample((B, 1, 1, 1)).to(x.device) # sample instance-wise convex weights
+    def training_step(self, batch, batch_idx):
+        x, t = batch
 
-        # if domain label is given:
-        if False:
-            # in this case, input x = [xˆi, xˆj]
-            perm = torch.arange(B-1, -1, -1) # inverse index
-            perm_j, perm_i = perm.chunk(2) # separate indices
-            perm_j = perm_j[torch.randperm(B // 2)] # shuffling
-            perm_i = perm_i[torch.randperm(B // 2)] # shuffling
-            perm = torch.cat([perm_j, perm_i], 0) # concatenation
-        else:
-            perm = torch.randperm(B) # generate shuffling indices
+        y = self(x).squeeze()
+        t_ = self.idx_to_class(t)
 
-        mu2, sig2 = mu[perm], sig[perm] # shuffling
-        mu_mix = mu * lmda + mu2 * (1 - lmda) # generate mixed mean
-        sig_mix = sig * lmda + sig2 * (1 - lmda) # generate mixed standard deviation
+        t_.requires_grad_(True)
 
-        return x_normed * sig_mix + mu_mix # denormalize input using the mixed statistics
 
-def res18(cfg):
-    if cfg.model.pretrained:
-        model = resnet18(ResNet18_Weights.DEFAULT)
-    else:
-        model = resnet18()
-    model.fc = nn.Linear(in_features=512, out_features=cfg.data.num_classes, bias=True)
-    
-    if cfg.mixstyle.active:
-        model.ms = MixStyle(
-            p=cfg.mixstyle.p,
-            alpha=cfg.mixstyle.alpha,
-            eps=cfg.mixstyle.eps
-        )
-    else:
-        model.ms = None
+        loss = F.mse_loss(y, t_)
 
-    def _forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.ms(x) if self.ms else x
-
-        x = self.layer2(x)
-        x = self.ms(x) if self.ms else x
-
-        x = self.layer3(x)
-        x = self.ms(x) if self.ms else x
-
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return x 
-    
-    model.forward = MethodType(_forward, model)
-
-    return model
-
-class ResnetClf(L.LightningModule):
-    def __init__(self, cfg, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.model = res18(cfg)
-
-        self.criterion = nn.CrossEntropyLoss()
-        self.accuracy = torchmetrics.classification.Accuracy(
-            task="multiclass", num_classes=cfg.data.num_classes)
-        
-        self.cfg = cfg
-
-    def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        X, t, d = batch
-
-        y = self.model(X)
-        loss = self.criterion(y, t)
-        self.log("train/loss", loss.item())
+        self.log("train/loss", loss, prog_bar=True)
 
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, t = batch
+
+        y = self(x).squeeze()
+        t_ = self.idx_to_class(t)
+
+        t_.requires_grad_(True)
+
+        loss = F.mse_loss(y, t_)
+        error = y - t_
+
+        self.log("val/loss", loss, prog_bar=True)
+        self.log('val/mean_abs_error', torch.abs(error).mean())
+        self.log('val/mean_std', error.std())
+
+        return loss
+
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+def get_backbone(type: str):
+    bb = None
     
-    def validation_step(self, batch, batch_idx, dataloader_idx=0) -> None:
-        X, t, d = batch
-
-        y = self.model(X)
-        loss = self.criterion(y, t)
-        self.accuracy(y, t)
-
-        self.log("val/loss", loss.item())
-        self.log("val/acc", self.accuracy, on_epoch=True)
-
-    def configure_optimizers(self) -> Any:
-        optimizer = optim.SGD(params=self.parameters(), lr=self.cfg.param.lr, weight_decay=1e-4, momentum=0.9)
-        # scheduler = lr_scheduler.StepLR(optimizer, )
-
-        return [optimizer]#, [scheduler]
+    match type:
+        case 'swin':
+            bb = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True)
+            bb.head.fc = nn.Identity()
+            out_dim = 768
+        case _:
+            raise Exception('Invalid backbone type')
+        
+    return bb, out_dim

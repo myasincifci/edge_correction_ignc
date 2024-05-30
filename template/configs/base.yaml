@@ -6,22 +6,19 @@ model:
     pretrained: True
 
 data:
-    path: /tmp
+    path: /home/cv_defect/YASIN/edge_correction_ignc/data/manufacturing_128_yasin
     num_classes: 7
 
 param:
-    lr: 2e-3
-    batch_size: 32
+    lr: 1e-5
+    batch_size: 128
 
 trainer:
     max_steps: 100_000
     check_val_every_n_epoch: 1
 
-mixstyle:
-    active: True
-    p: 1.0 
-    alpha: 0.1
-    eps: 1e-6
+backbone:
+    type: swin
 
 logger:
-    project: supervised-pacs-base
+    project: cv_defect_manufacturing

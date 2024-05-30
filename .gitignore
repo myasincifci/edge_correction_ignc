@@ -7,3 +7,5 @@ wandb/
 outputs/
 lightning_logs/
 __pycache__/
+
+template/cv_defect_manufacturing
